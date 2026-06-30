@@ -1,24 +1,44 @@
 # Interview Prep PDF Generator
 
-Generate interview question PDFs from web research, with **Chroma** vector caching and a **local LLM** (Meta Llama 3.2 via Ollama by default). Built with **LangChain**.
+Generate interview question PDFs from web research using **LangChain**, **Ollama**, and **Chroma**.
+
+The current implementation is optimized for repeatable runs:
+
+- **PDF is output only**
+- **Q&A JSON store is the source of truth**
+- **Refresh runs process only new websites**
+- **Question-level dedupe prevents repeats across refreshes**
 
 ## Features
 
-1. Search the web for interview Q&A by topic / sub-topic (`--num-sites` controls how many sites)
-2. Scrape and extract text from pages
-3. Deduplicate content from multiple sources
-4. Store chunks in **Chroma** for reuse on later runs
-5. **Q&A store** (`data/qa/*.json`) — source of truth; PDF is export only
-6. Incremental extract from **new sites only** (bounded LLM per run)
-7. Question-level dedupe across refreshes (hash + embedding similarity)
-8. Write a formatted PDF: **Level → Question → Answer → Source**
-8. **Remembers** what was already searched; skips the web unless you pass `--refresh-internet`
-9. On `--refresh-internet`, fetches **new websites only** (visited URLs are stored in `search_state.json` and excluded; search query rotates each refresh)
+1. Search the web by topic and sub-topic.
+2. Scrape pages in parallel and extract usable text.
+3. Remove duplicate source text before storage.
+4. Store source chunks in **Chroma** for retrieval and migration support.
+5. Persist canonical questions in `data/qa/*.json`.
+6. Extract only a **bounded number of new Q&A items per run**.
+7. Deduplicate questions across refreshes with normalized hash + embedding similarity.
+8. Track visited URLs so `--refresh-internet` prefers new websites.
+9. Export a formatted PDF with `Level`, `Question`, `Answer`, and `Source`.
+10. Support fast cache-only runs that regenerate PDF from the stored Q&A set.
+
+## Why the implementation changed
+
+The earlier design re-read the generated PDF and merged everything again on every refresh. That became slow and unstable as the PDF grew.
+
+The new design avoids that:
+
+- `data/qa/*.json` stores the long-term question bank.
+- `data/pdfs/*.pdf` is regenerated from that store.
+- `--refresh-internet` only processes **new scraped text** from new URLs.
+- The LLM call is capped by `pipeline.max_new_questions_per_run`.
 
 ## Prerequisites
 
 - Python 3.11+
-- [Ollama](https://ollama.com/) with Llama 3.2:
+- [Ollama](https://ollama.com/)
+
+Pull the required models:
 
 ```bash
 ollama pull llama3.2
@@ -26,130 +46,173 @@ ollama pull nomic-embed-text
 ollama serve
 ```
 
+`llama3.2` is used for Q&A extraction. `nomic-embed-text` is used for faster embeddings.
+
 ## Install
 
-This folder is a **uv workspace member** of your home project (parent `~/pyproject.toml` lists `Desktop/sourav`). Dependencies install into **`~/.venv`**, not a separate `sourav/.venv`.
+This folder is a `uv` workspace member of your home project, so dependencies install into `~/.venv`.
 
 ```bash
-# From home directory (recommended)
 cd ~
 uv sync
 
-# Run the app (from sourav folder)
 cd Desktop/sourav
 uv run python main.py --topic "Data Engineering" --subtopic "pyspark" -n 3
 ```
 
-### Target ~3 minutes per run
+## Interpreter setup
 
-| Run type | Recommended command |
-|----------|---------------------|
-| First run / refresh | `-n 3` (default) |
-| Faster refresh | `-n 2` |
-| Cache-only (no web, no LLM) | same topic, omit `--refresh-internet` |
+In Cursor / VS Code, use:
 
-Tune `config.yaml` → `pipeline.max_new_questions_per_run` (default 8) and `embeddings.model: nomic-embed-text`.
+`/Users/ayushisouravgupta/.venv/bin/python`
 
-**IDE setup:** In Cursor/VS Code, select interpreter: `~/ayushisouravgupta/.venv/bin/python`  
-(Project `.vscode/settings.json` points there automatically.)
+If import squiggles remain after `uv sync`, reload the window.
 
-If imports still fail after `uv sync`, reload the window: Command Palette → **Developer: Reload Window**.
+## Recommended runtime targets
+
+### Best settings for about 3 minutes
+
+| Run type | Recommendation |
+|---------|----------------|
+| First run | `-n 3` |
+| Refresh with new sites | `--refresh-internet -n 3` |
+| Faster refresh | `--refresh-internet -n 2` |
+| Cache-only PDF export | omit `--refresh-internet` |
+
+### What to expect
+
+| Scenario | Typical behavior |
+|---------|------------------|
+| First run / refresh | Web + scrape + embed + bounded LLM extract |
+| Cache-only run | No web, no extraction LLM, PDF export from Q&A store |
+| Embedding model changed | Chroma collection may be reset automatically for that topic |
 
 ## Configuration
 
-Edit `config.yaml`:
+Main settings live in `config.yaml`.
 
 | Section | Purpose |
 |---------|---------|
-| `paths.pdf_output_dir` | Where PDFs are saved |
+| `paths.pdf_output_dir` | Generated PDFs |
+| `paths.qa_store_dir` | Canonical Q&A JSON files |
+| `paths.state_file` | Search history and visited URLs |
 | `paths.chroma_persist_dir` | Chroma persistence |
-| `paths.state_file` | Topics already searched |
-| `llm.*` | Chat model (provider, model, base_url) |
-| `embeddings.*` | Embedding model for Chroma |
-| `dedup.similarity_threshold` | Text dedup sensitivity |
+| `llm.*` | Chat model for extraction |
+| `embeddings.*` | Embedding model for Chroma and question dedupe |
+| `web.request_timeout_seconds` | Per-request timeout |
+| `web.scrape_workers` | Parallel scraper worker count |
+| `dedup.similarity_threshold` | Source-text dedupe |
+| `dedup.question_similarity_threshold` | Cross-refresh question dedupe |
+| `vectorstore.chunk_size` | Chroma chunk size |
+| `pipeline.chroma_search_k` | Number of chunks used for migration / lookup |
+| `pipeline.max_context_chars` | Max chars sent to extraction LLM |
+| `pipeline.max_new_questions_per_run` | Upper bound of new Q&A items per run |
+| `pipeline.max_questions_per_topic` | Cap on stored questions per topic |
 
-Environment overrides use prefix `INTERVIEW_` (see `.env.example`).
+Environment overrides use the `INTERVIEW_` prefix.
 
 ## Usage
 
+### First run
+
 ```bash
-# First run: fetches web, stores in Chroma, generates PDF
-python main.py --topic "Python" --subtopic "Decorators" --num-sites 5
-
-# Second run: uses Chroma + existing PDF (no web)
-python main.py --topic "Python" --subtopic "Decorators"
-
-# Force new web content and merge into PDF (skips previously visited URLs)
-python main.py --topic "Python" --subtopic "Decorators" --refresh-internet --num-sites 3
-
-# List cached topics
-python main.py --list-searched
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark" -n 3
 ```
 
-Output PDF example path: `data/pdfs/python_decorators.pdf`
+### Refresh from new sites only
 
-## End-to-end flow (diagrams & use cases)
+```bash
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark" --refresh-internet -n 3
+```
 
-See **[docs/END_TO_END_FLOW.md](docs/END_TO_END_FLOW.md)** for Mermaid diagrams, all use cases, and a full **Data Engineering** walkthrough.
+### Cache-only PDF export
 
-**PDF version:** [docs/END_TO_END_FLOW.pdf](docs/END_TO_END_FLOW.pdf)
+```bash
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark"
+```
 
-Regenerate the PDF after editing the markdown:
+### List searched topics
+
+```bash
+uv run python main.py --list-searched
+```
+
+## Current architecture
+
+```text
+User CLI
+  -> Pipeline
+     -> SearchState (visited URLs, search count)
+     -> [optional] DDGS search
+     -> [optional] parallel scraper
+     -> [optional] text dedupe
+     -> [optional] Chroma storage
+     -> [optional] bounded LLM extract from new batch only
+     -> QAStore JSON (canonical question bank)
+     -> PDF export
+```
+
+## Data flow
+
+### First run / refresh
+
+1. Search new websites.
+2. Scrape and dedupe page text.
+3. Store chunks in Chroma.
+4. Send only this batch to the LLM.
+5. Deduplicate new questions against the existing Q&A store.
+6. Save the updated Q&A store.
+7. Regenerate the PDF.
+
+### Cache-only run
+
+1. Skip web.
+2. Skip extraction LLM.
+3. Load Q&A JSON store.
+4. Export PDF directly.
+
+## Question dedupe strategy
+
+Questions do not rely only on URL memory.
+
+They are deduplicated using:
+
+1. normalized question text
+2. stable question hash
+3. embedding similarity against the stored question bank
+
+When the same question appears on another site, the app keeps one canonical question and appends the new source URL.
+
+## PDF format
+
+Each PDF block contains:
+
+- `Question level`
+- `Question`
+- `Answer`
+- `Source`
+
+Sources may contain multiple URLs joined together when duplicate questions are merged from multiple websites.
+
+## Data directories
+
+```text
+data/
+  chroma/            # Source chunks and vector index
+  pdfs/              # Generated PDFs
+  qa/                # Canonical question bank JSON
+  search_state.json  # Topics, visited URLs, search count
+```
+
+## End-to-end flow docs
+
+Detailed diagrams and use cases:
+
+- [docs/END_TO_END_FLOW.md](docs/END_TO_END_FLOW.md)
+- [docs/END_TO_END_FLOW.pdf](docs/END_TO_END_FLOW.pdf)
+
+Regenerate the PDF version after editing the markdown:
 
 ```bash
 uv run python scripts/generate_flow_pdf.py
 ```
-
-## Architecture
-
-```
-User CLI
-   │
-   ▼
-Pipeline ──► SearchState (JSON)     "already searched?"
-   │
-   ├─► [if needed] DuckDuckGo → Scraper → Dedup → Chroma
-   │
-   ├─► Load existing PDF text
-   │
-   ├─► Chroma similarity search
-   │
-   └─► LLM merge (unique Q&A JSON) → ReportLab PDF
-```
-
-## PDF format
-
-Each question block contains:
-
-- **Question level** (Easy / Medium / Hard)
-- **Question**
-- **Answer**
-- **Source** (URL or "Cached PDF")
-
-## Switching models
-
-In `config.yaml`:
-
-```yaml
-llm:
-  provider: ollama
-  model: llama3.2
-  base_url: http://localhost:11434
-
-embeddings:
-  provider: ollama
-  model: llama3.2
-```
-
-For OpenAI (optional), set `provider: openai` and `OPENAI_API_KEY`.
-
-## Data directories
-
-```
-data/
-  pdfs/           # Generated PDFs
-  chroma/         # Vector DB
-  search_state.json
-```
-
-Add `data/` to `.gitignore` if you commit this repo.

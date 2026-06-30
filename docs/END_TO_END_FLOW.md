@@ -1,6 +1,13 @@
 # End-to-End Flow — Interview Prep Application
 
-Example topic used throughout: **Data Engineering** (with optional sub-topics).
+Example topic used throughout: **Data Engineering / PySpark**.
+
+This document reflects the **current implementation**, where:
+
+- the **Q&A JSON store** is the source of truth
+- the **PDF is export only**
+- refresh runs process **new sites only**
+- question dedupe happens **across all refreshes**
 
 ---
 
@@ -9,7 +16,7 @@ Example topic used throughout: **Data Engineering** (with optional sub-topics).
 ```mermaid
 flowchart TB
     subgraph user_grp [User CLI]
-        CMD[python main.py]
+        CMD[uv run python main.py]
     end
 
     subgraph app_grp [Application]
@@ -19,65 +26,91 @@ flowchart TB
     end
 
     subgraph ext_grp [External services]
-        DDG[DuckDuckGo Search]
+        DDGS[DDGS Search]
         WEB[Interview websites]
-        OLLAMA[Ollama Llama 3.2]
+        OLLAMA[Ollama]
     end
 
     subgraph store_grp [Local persistence]
         STATE[search_state.json]
-        CHROMA[Chroma vector DB]
+        CHROMA[Chroma]
+        QASTORE[data/qa json]
         PDFOUT[data/pdfs]
     end
 
     CMD --> MAIN
-    MAIN --> CFG
     MAIN --> PIPE
+    MAIN --> CFG
     PIPE --> STATE
-    PIPE --> DDG
-    DDG --> WEB
+    PIPE --> DDGS
+    DDGS --> WEB
     WEB --> CHROMA
     PIPE --> CHROMA
+    PIPE --> QASTORE
     PIPE --> PDFOUT
     PIPE --> OLLAMA
-    CHROMA --> OLLAMA
 ```
 
 ---
 
-## 2. Decision flow (every run)
+## 2. High-level design change
 
-When you run the app, it first decides **whether to hit the internet**.
+### Old approach
+
+```text
+web + old PDF + old cache -> one large LLM merge -> PDF
+```
+
+Problems:
+
+- prompt grows after each refresh
+- duplicate questions slip through
+- long runs become slow and unstable
+
+### New approach
+
+```text
+new web batch only -> bounded LLM extract -> dedupe vs Q&A store -> save JSON -> export PDF
+```
+
+Benefits:
+
+- bounded LLM work per refresh
+- no need to re-read old PDF
+- cache-only runs skip LLM entirely
+
+---
+
+## 3. Decision flow (every run)
 
 ```mermaid
 flowchart TD
-    START([User runs CLI]) --> LIST{list searched flag?}
-    LIST -->|Yes| SHOW[Print topics from state]
+    START([Run CLI]) --> LIST{list searched flag}
+    LIST -->|Yes| SHOW[Print search history]
     SHOW --> END1([Exit])
 
-    LIST -->|No| KEY[Build topic_key]
-    KEY --> PREV{Topic in state file?}
-    PREV -->|No| WEB[Fetch web - Use Case 1]
-    PREV -->|Yes| REF{refresh internet flag?}
-    REF -->|No| CACHE[Use cache only - Use Case 2]
-    REF -->|Yes| WEBNEW[Fetch NEW sites - Use Case 3]
+    LIST -->|No| PREV{Topic already searched}
+    PREV -->|No| FIRST[First run]
+    PREV -->|Yes| REF{refresh internet flag}
+    REF -->|No| CACHE[Cache only export]
+    REF -->|Yes| NEWWEB[Search new websites only]
 
-    WEB --> MERGE
-    WEBNEW --> MERGE
-    CACHE --> MERGE[Chroma plus PDF LLM merge]
-
-    MERGE --> OUT([PDF output])
+    FIRST --> EXTRACT
+    NEWWEB --> EXTRACT
+    CACHE --> EXPORT
+    EXTRACT --> DEDUPE
+    DEDUPE --> EXPORT[Export PDF from Q&A store]
 ```
 
-| Condition | Web? | Source of content |
-|-----------|------|-------------------|
-| First time for topic | Yes | DuckDuckGo → scrape → Chroma |
-| Topic exists, no `--refresh-internet` | No | Chroma + existing PDF |
-| Topic exists + `--refresh-internet` | Yes (new URLs only) | New sites → append Chroma + merge with PDF |
+| Condition | Web? | LLM? | Main source |
+|-----------|------|------|-------------|
+| First run | Yes | Yes | New scraped batch |
+| Refresh | Yes | Yes | New scraped batch only |
+| Cache-only | No | No | Existing `data/qa/*.json` |
 
 ---
 
-## 3. Detailed pipeline (web fetch path)
+## 4. Detailed runtime flow
 
 ```mermaid
 sequenceDiagram
@@ -86,227 +119,249 @@ sequenceDiagram
     participant CLI as main.py
     participant P as Pipeline
     participant S as SearchState
-    participant D as DuckDuckGo
+    participant D as DDGS
     participant SC as Scraper
-    participant DD as Dedup
     participant V as Chroma
     participant L as Llama 3.2
-    participant PDFW as PDF Writer
+    participant Q as QAStore
+    participant PDF as PDF Writer
 
-    U->>CLI: topic Data Engineering subtopic Spark
-    CLI->>P: run pipeline
-    P->>S: check has_searched
+    U->>CLI: topic Data Engineering, subtopic pyspark
+    CLI->>P: run
+    P->>S: check topic_key
 
-    alt First run or refresh internet
-        P->>D: search exclude visited if refresh
-        D-->>P: 5 URLs
-        P->>SC: scrape each URL to text
+    alt First run or refresh
+        P->>D: search new URLs
+        D-->>P: N results
+        P->>SC: scrape in parallel
         SC-->>P: Documents
-        P->>DD: remove duplicate text
-        DD-->>P: unique Documents
-        P->>V: embed and store in Chroma
-        P->>S: register_search and visited_urls
+        P->>V: store chunks
+        P->>S: save visited URLs
+        P->>L: extract bounded Q and A from this batch
+        L-->>P: candidate questions
+        P->>Q: add, dedupe, merge sources
+    else Cache-only run
+        P->>Q: load stored questions
     end
 
-    P->>PDFW: load existing PDF text if any
-    P->>V: similarity_search on topic
-    V-->>P: relevant chunks
-    P->>L: merge to JSON Q and A
-    L-->>P: InterviewQA list
-    P->>PDFW: generate_interview_pdf
-    PDFW-->>U: output PDF path
+    P->>PDF: export all stored questions
+    PDF-->>U: PDF path
 ```
 
 ---
 
-## 4. Use cases — Data Engineering
+## 5. Key data stores
 
-### Use Case 1 — First-time topic (web + new PDF)
+```mermaid
+flowchart LR
+    WEB[Scraped web text] --> CHROMA[Chroma chunks]
+    CHROMA --> LLM[Bounded extract]
+    LLM --> QASTORE[Q and A JSON store]
+    QASTORE --> PDF[Generated PDF]
+```
 
-**Goal:** User wants interview questions for Data Engineering for the first time.
+### Responsibilities
+
+| Store | Purpose |
+|------|---------|
+| `search_state.json` | search history, visited URLs, refresh count |
+| `data/chroma/` | source text chunks for retrieval and migration |
+| `data/qa/*.json` | canonical question bank |
+| `data/pdfs/*.pdf` | export artifact only |
+
+---
+
+## 6. Use cases — Data Engineering / PySpark
+
+### Use Case 1 — First run
 
 ```bash
-python main.py --topic "Data Engineering" --num-sites 5
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark" -n 3
 ```
 
 ```mermaid
 flowchart LR
-    A[Search query] --> B[5 new URLs]
-    B --> C[Scrape and dedup]
-    C --> D[Chroma collection]
-    D --> E[LLM merge]
-    E --> F[PDF file]
-    G[search_state.json] -.-> D
+    A[3 new URLs] --> B[Parallel scrape]
+    B --> C[Text dedupe]
+    C --> D[Chroma store]
+    D --> E[LLM extract max new items]
+    E --> F[Question dedupe]
+    F --> G[QAStore JSON]
+    G --> H[PDF export]
 ```
 
-**What happens**
+What happens:
 
-1. DuckDuckGo returns 5 sites (e.g. GeeksforGeeks, InterviewBit, Medium, etc.).
-2. Text extracted, near-duplicates removed (~85% similarity threshold).
-3. Chunks embedded (Llama 3.2 embeddings) and stored in Chroma.
-4. LLM produces structured Q&A: Level | Question | Answer | Source.
-5. PDF saved; state records topic + visited URLs.
-
-**Sample PDF block**
-
-| Field | Example |
-|-------|---------|
-| Level | Medium |
-| Question | What is the difference between ETL and ELT? |
-| Answer | ETL transforms before load; ELT loads raw data first… |
-| Source | https://example.com/data-engineering-interview |
+1. Search up to 3 sites.
+2. Scrape with multiple workers.
+3. Store chunks in Chroma.
+4. Extract a bounded number of questions from this batch.
+5. Save only unique questions into the Q&A store.
+6. Export PDF from the full store.
 
 ---
 
-### Use Case 2 — Same topic, offline / fast regenerate (cache only)
-
-**Goal:** User already ran once; wants an updated PDF without waiting for web or using Ollama only on merge.
+### Use Case 2 — Cache-only export
 
 ```bash
-python main.py --topic "Data Engineering"
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark"
 ```
 
 ```mermaid
 flowchart LR
-    A["Topic in state?"] -->|Yes| B["Skip web"]
-    B --> C["Chroma similarity search"]
-    B --> D["Load existing PDF text"]
-    C --> E["LLM merge"]
-    D --> E
-    E --> F[Overwrite same PDF path]
+    A[Topic already exists] --> B[Skip web]
+    B --> C[Skip extraction LLM]
+    C --> D[Load Q and A store]
+    D --> E[Export PDF]
 ```
 
-**What happens**
+What happens:
 
-- No HTTP to interview sites.
-- Retrieves best-matching chunks from Chroma for `"Data Engineering interview questions..."`.
-- Reads prior PDF from `data/pdfs/data-engineering.pdf` if present.
-- LLM deduplicates and reformats → new PDF at same path.
+- no web search
+- no scraping
+- no extraction LLM
+- very fast PDF regeneration
 
-**When to use:** Quick refresh of formatting, tweak LLM output, or re-run after fixing Ollama — without new content.
+This is the preferred run when content already exists and you only need the PDF again.
 
 ---
 
-### Use Case 3 — Sub-topic (narrower scope)
-
-**Goal:** Focus on Apache Spark within Data Engineering.
+### Use Case 3 — Refresh with new websites only
 
 ```bash
-python main.py --topic "Data Engineering" --subtopic "Apache Spark" --num-sites 5
-```
-
-```mermaid
-flowchart TB
-    T1[topic_key data engineering apache spark]
-    T2[Separate Chroma collection]
-    T3[Separate PDF file]
-    T1 --> T2 --> T3
-```
-
-**Note:** Sub-topic is a **different cache key** from the parent topic. Parent and sub-topic each have their own Chroma collection, state entry, and PDF.
-
----
-
-### Use Case 4 — Refresh internet (new websites + append)
-
-**Goal:** User finished first PDF; wants **more questions from new sources**, merged into one PDF.
-
-```bash
-python main.py --topic "Data Engineering" --subtopic "Apache Spark" \
-  --refresh-internet --num-sites 5
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark" --refresh-internet -n 3
 ```
 
 ```mermaid
 flowchart TD
-    V[visited_urls from state] --> X[Exclude those URLs]
-    X --> Q[Rotated search query]
-    Q --> N[Pick 5 NEW URLs]
-    N --> S[Scrape dedup append Chroma]
-    S --> M[LLM merge new and old content]
-    M --> P[Updated PDF]
+    A[visited URLs] --> B[Exclude seen URLs]
+    B --> C[Search different wording]
+    C --> D[Scrape new websites]
+    D --> E[Store new chunks]
+    E --> F[Extract only from this batch]
+    F --> G[Dedupe vs full Q and A store]
+    G --> H[Append only unique questions]
+    H --> I[Export updated PDF]
 ```
 
-**What happens**
+What happens:
 
-1. Skips all URLs in `visited_urls` for that topic.
-2. Uses alternate search phrasing (rotates each `search_count`).
-3. Appends new chunks to existing Chroma collection (does not wipe old data).
-4. LLM merges old PDF + new web content without duplicate questions.
-5. Adds new URLs to `visited_urls`.
+1. URLs already seen are excluded.
+2. New search wording is rotated.
+3. Only the new batch is sent to the extraction LLM.
+4. New questions are deduped against all historical questions.
+5. PDF is regenerated from the updated Q&A store.
 
 ---
 
-### Use Case 5 — Refresh but no new sites left
-
-**Goal:** User runs `--refresh-internet` again but search has no unseen URLs.
+### Use Case 4 — No new URLs found
 
 ```mermaid
 flowchart TD
-    A[refresh internet flag] --> B[Search with exclude list]
-    B --> C{New URLs found?}
-    C -->|No| D["Warning: no new websites"]
-    D --> E[Regenerate PDF from cache only]
-    C -->|Yes| F["Normal Use Case 4 flow"]
+    A[refresh internet] --> B[search with exclude list]
+    B --> C{new URLs found}
+    C -->|No| D[keep existing Q and A store]
+    D --> E[export PDF only]
+    C -->|Yes| F[normal refresh flow]
 ```
 
 ---
 
-### Use Case 6 — List all prepared topics
+### Use Case 5 — Embedding model changed
 
-```bash
-python main.py --list-searched
-```
-
-**Example output**
-
-```
-data engineering | PDF: data/pdfs/data-engineering.pdf | web searches: 1 | last: 2026-05-23T...
-data engineering::apache spark | PDF: .../data-engineering_apache-spark.pdf | web searches: 2 | ...
-```
-
----
-
-### Use Case 7 — Custom config / paths
-
-**Goal:** Store PDFs on an external drive; use a different Ollama model.
-
-Edit `config.yaml` or env vars, then run as usual:
-
-```bash
-python main.py --topic "Data Engineering" --config /path/to/config.yaml
-```
+Example: previous Chroma built with `llama3.2`, current config uses `nomic-embed-text`.
 
 ```mermaid
 flowchart LR
-    CFG[config.yaml] --> PATHS[pdf and chroma paths]
-    CFG --> LLM[llm.model llama3.2]
-    CFG --> EMB[embeddings.model]
+    A[Chroma dimension mismatch] --> B[Fallback read or reset collection]
+    B --> C[Migrate or rebuild chunks]
+    C --> D[Continue with current embedding model]
 ```
+
+What happens in the app:
+
+- migration path can read stored chunks directly
+- new inserts can reset that topic's Chroma collection when dimensions differ
+- the Q&A store remains the stable source of truth
 
 ---
 
-## 5. Data Engineering — example journey (all use cases)
+## 7. How duplicate questions are prevented
 
 ```mermaid
 flowchart LR
-    UC1[UC1 First run main topic] --> UC3[UC3 Sub-topic Spark]
-    UC3 --> UC2[UC2 Regenerate from cache]
-    UC2 --> UC4a[UC4 Refresh internet]
-    UC4a --> UC4b[UC4 Refresh again]
-    UC4b --> UC6[UC6 List searched topics]
+    A[New candidate question] --> B[Normalize text]
+    B --> C[Hash compare]
+    C -->|match| DUP[Duplicate]
+    C -->|no match| D[Embedding similarity]
+    D -->|high similarity| DUP
+    D -->|new| ADD[Add to Q and A store]
+```
+
+When a duplicate is found:
+
+- sources are merged
+- the better / longer answer can replace the old one
+- only one canonical question stays in the store
+
+This works across the first refresh and the nth refresh, even when websites are different.
+
+---
+
+## 8. Performance constraints and tuning
+
+### Recommended operating point
+
+| Run type | Recommended setting |
+|---------|---------------------|
+| First run | `-n 3` |
+| Refresh | `--refresh-internet -n 3` |
+| Faster refresh | `--refresh-internet -n 2` |
+| Cache-only | omit `--refresh-internet` |
+
+### Why this usually stays near 3 minutes
+
+```mermaid
+flowchart LR
+    A[3 websites] --> B[Parallel scrape]
+    B --> C[Fewer chunks from larger chunk size]
+    C --> D[Fast embeddings with nomic-embed-text]
+    D --> E[LLM capped by max_new_questions_per_run]
+    E --> F[Export PDF]
+```
+
+Settings that support this:
+
+- `web.scrape_workers: 3`
+- `web.request_timeout_seconds: 15`
+- `vectorstore.chunk_size: 2000`
+- `pipeline.max_context_chars: 6000`
+- `pipeline.max_new_questions_per_run: 10`
+- `embeddings.model: nomic-embed-text`
+
+---
+
+## 9. Example journey
+
+```mermaid
+flowchart LR
+    A[First run -n 3] --> B[Refresh -n 3]
+    B --> C[Refresh -n 2]
+    C --> D[Cache only export]
+    D --> E[List searched topics]
 ```
 
 | Step | Command | Result |
 |------|---------|--------|
-| 1 | `python main.py -t "Data Engineering" -n 5` | First PDF + Chroma + 5 URLs in state |
-| 2 | `python main.py -t "Data Engineering" -s "Apache Spark" -n 5` | Separate Spark PDF + cache |
-| 3 | `python main.py -t "Data Engineering"` | PDF regenerated from cache (no web) |
-| 4 | `python main.py -t "Data Engineering" --refresh-internet -n 5` | 5 **new** sites, merged PDF |
-| 5 | `python main.py --list-searched` | See both topics and search counts |
+| 1 | `uv run python main.py -t "Data Engineering" -s "pyspark" -n 3` | first Q&A store + PDF |
+| 2 | `uv run python main.py -t "Data Engineering" -s "pyspark" --refresh-internet -n 3` | adds only unique new questions |
+| 3 | `uv run python main.py -t "Data Engineering" -s "pyspark" --refresh-internet -n 2` | smaller bounded refresh |
+| 4 | `uv run python main.py -t "Data Engineering" -s "pyspark"` | fast PDF export from store |
+| 5 | `uv run python main.py --list-searched` | inspect search history |
 
 ---
 
-## 6. Component map
+## 10. Component map
 
 ```mermaid
 flowchart TB
@@ -318,101 +373,87 @@ flowchart TB
         P[pipeline.py]
         C[config.py]
         ST[state.py]
+        QA[qa_store.py]
+        QD[question_dedup.py]
     end
 
     subgraph ingest_grp [Ingest]
         WS[web_search.py]
         SCR[scraper.py]
         DED[dedup.py]
+        VS[vectorstore.py]
     end
 
-    subgraph intel_grp [Intelligence]
+    subgraph intelligence_grp [LLM]
         LF[llm_factory.py]
         MOD[models.py]
     end
 
-    subgraph out_grp [Output]
-        VS[vectorstore.py]
-        PDFF[pdf_io.py]
+    subgraph output_grp [Output]
+        PDF[pdf_io.py]
     end
 
     M --> P
     P --> C
     P --> ST
+    P --> QA
+    P --> QD
     P --> WS
     P --> SCR
     P --> DED
     P --> VS
     P --> MOD
-    P --> PDFF
+    P --> PDF
     MOD --> LF
     VS --> LF
+    QD --> LF
 ```
 
 ---
 
-## 7. PDF output structure
+## 11. Files on disk
 
-Every generated PDF follows this repeating block:
-
-```
-┌─────────────────────────────────────────┐
-│ Interview Questions: Data Engineering   │
-│              — Apache Spark             │
-├─────────────────────────────────────────┤
-│ Question 1 — Level: Easy                │
-│ Question                                │
-│   What is RDD?                          │
-│ Answer                                  │
-│   Resilient Distributed Dataset is...   │
-│ Source                                  │
-│   https://...                           │
-├─────────────────────────────────────────┤
-│ Question 2 — Level: Hard                │
-│ ...                                     │
-└─────────────────────────────────────────┘
-```
-
----
-
-## 8. Files on disk (after Use Case 1 + 3)
-
-```
+```text
 data/
-├── search_state.json          # topics, visited_urls, search_count
-├── chroma/                    # persisted embeddings
-│   └── (collections per topic_key)
-└── pdfs/
-    ├── data-engineering.pdf
-    └── data-engineering_apache-spark.pdf
+├── chroma/
+│   └── chroma.sqlite3
+├── pdfs/
+│   └── data-engineering_pyspark.pdf
+├── qa/
+│   └── data-engineering_pyspark.json
+└── search_state.json
 ```
 
 ---
 
-## 9. Prerequisites checklist
+## 12. Prerequisites checklist
 
 ```mermaid
 flowchart LR
-    O[Ollama running] --> M[llama3.2 pulled]
-    M --> RUN[python main.py ...]
-    PY[Python 3.11+ + deps] --> RUN
+    A[uv sync] --> B[ollama pull llama3.2]
+    B --> C[ollama pull nomic-embed-text]
+    C --> D[ollama serve]
+    D --> E[uv run python main.py ...]
 ```
 
 ```bash
-ollama pull llama3.2
-ollama serve
+cd ~
 uv sync
-python main.py --topic "Data Engineering" --num-sites 5
+ollama pull llama3.2
+ollama pull nomic-embed-text
+ollama serve
+cd Desktop/sourav
+uv run python main.py --topic "Data Engineering" --subtopic "pyspark" -n 3
 ```
 
 ---
 
-## 10. Quick reference
+## 13. Quick reference
 
-| Intent | Flags |
-|--------|-------|
-| New topic, fetch web | `--topic "Data Engineering" -n 5` |
-| Sub-topic | add `--subtopic "Apache Spark"` |
-| No web, use cache | same topic, **no** `--refresh-internet` |
-| New websites only | `--refresh-internet -n 5` |
-| See history | `--list-searched` |
+| Intent | Command shape |
+|--------|---------------|
+| First run | `-t TOPIC -s SUBTOPIC -n 3` |
+| Refresh from new sites | `-t TOPIC -s SUBTOPIC --refresh-internet -n 3` |
+| Faster refresh | `--refresh-internet -n 2` |
+| Cache-only export | same topic, no refresh flag |
+| List topic history | `--list-searched` |
