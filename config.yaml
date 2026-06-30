@@ -1,0 +1,45 @@
+# Interview Prep Application Configuration
+
+paths:
+  pdf_output_dir: "./data/pdfs"
+  qa_store_dir: "./data/qa"
+  state_file: "./data/search_state.json"
+  chroma_persist_dir: "./data/chroma"
+
+llm:
+  provider: "ollama"
+  model: "llama3.2"
+  base_url: "http://localhost:11434"
+  temperature: 0.2
+
+# Faster embeddings (recommended): ollama pull nomic-embed-text
+embeddings:
+  provider: "ollama"
+  model: "nomic-embed-text"
+  base_url: "http://localhost:11434"
+
+web:
+  max_results_per_query: 10
+  request_timeout_seconds: 15
+  scrape_workers: 3
+  user_agent: "InterviewPrepBot/1.0"
+
+dedup:
+  similarity_threshold: 0.85
+  question_similarity_threshold: 0.88
+
+vectorstore:
+  chunk_size: 2000
+  chunk_overlap: 100
+
+pipeline:
+  chroma_search_k: 6
+  max_context_chars: 6000
+  max_new_questions_per_run: 10
+  max_questions_per_topic: 80
+
+pdf:
+  page_size: "A4"
+  margin_mm: 20
+  title_font_size: 16
+  body_font_size: 10

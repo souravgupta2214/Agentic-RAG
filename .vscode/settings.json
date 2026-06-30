@@ -1,0 +1,6 @@
+{
+  "python.defaultInterpreterPath": "/Users/ayushisouravgupta/.venv/bin/python",
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+  "python.terminal.activateEnvironment": true,
+  "python-envs.defaultPackageManager": "ms-python.python:uv"
+}

@@ -1,0 +1,7 @@
+{
+  "venvPath": "/Users/ayushisouravgupta",
+  "venv": ".venv",
+  "extraPaths": ["."],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "basic"
+}
